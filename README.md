@@ -424,11 +424,12 @@ PYTHONPATH=backend .venv/bin/pytest
 
 ## 检索评测
 
-新版独立评测位于 `evals/rag/`，包含固定语料和 100 道五分桶题目：
+独立评测位于 `evals/rag/`，包含 100 道五分桶题目。扩展模式使用 51 篇混合文档、
+约 34.6 万字符和 1151 个 Chunk，并支持 Dense、BM25、Hybrid RRF 对照：
 
 ```bash
-PYTHONPATH=backend .venv/bin/python -m evals.rag.runner --split dev --k 5
-PYTHONPATH=backend .venv/bin/python -m evals.rag.runner --split test --k 5
+PYTHONPATH=backend .venv/bin/python -m evals.rag.runner \
+  --corpus-profile mixed --split test --k 5 --retrieval-mode compare
 ```
 
 可选 `--end-to-end` 执行完整 Agent 回答评测。详细口径见 `evals/rag/README.md`。旧的 `evals/runner.py` 保留为上传自有语料后的轻量评测示例。
@@ -498,4 +499,5 @@ conversation_messages 原始消息永久保存
 PYTHONPATH=backend .venv/bin/python -m evals.rag.runner --split test --k 5
 ```
 
-指标包括 Hit@5、Recall@5、Precision@5、MRR、NDCG@5、关键词覆盖、拒答准确率与延迟；加 `--end-to-end` 可评估回答、引用和拒答。
+扩展测试集基线（64 道可回答题）为 Hybrid Recall@5 80.47%、MRR 76.82%、NDCG@5 75.13%；
+详细口径、Dense/BM25 对照和负样本边界见 `evals/rag/README.md`。加 `--end-to-end` 可另行评估回答、引用和最终拒答。
