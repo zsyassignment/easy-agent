@@ -1,0 +1,1586 @@
+/**
+ * Tests for the JSONL transcript reader used by adopt-bridge mode.
+ *
+ *   - drainTranscript handles missing files, half-written tail lines,
+ *     truncation, and malformed lines without throwing.
+ *   - pickAssistantTextEvents filters out user / sidechain / tool-only events.
+ *   - extractAssistantText / joinAssistantText concatenate multi-block text.
+ */
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync, appendFileSync, openSync, writeSync, closeSync, ftruncateSync, utimesSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, basename } from 'node:path';
+import { shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
+import {
+  drainTranscript,
+  pickAssistantTextEvents,
+  extractAssistantText,
+  joinAssistantText,
+  trailingAssistantText,
+  findLatestJsonl,
+  findJsonlContainingFingerprint,
+  jsonlContainsFingerprint,
+  extractLastAssistantTurn,
+  isMeaningfulUserEvent,
+  readFirstEventTimestamp,
+  findJsonlsContainingExactContent,
+  splitTranscriptEventsByCutoff,
+  isTranscriptRateLimitEvent,
+  classifyClaudeTerminalEvent,
+  apiErrorMessageText,
+  type TranscriptEvent,
+} from '../src/services/claude-transcript.js';
+
+let dir: string;
+let path: string;
+
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), 'bmx-tx-'));
+  path = join(dir, 'session.jsonl');
+});
+
+afterEach(() => {
+  rmSync(dir, { recursive: true, force: true });
+});
+
+function appendLine(obj: unknown): void {
+  appendFileSync(path, JSON.stringify(obj) + '\n', 'utf8');
+}
+
+describe('drainTranscript', () => {
+  it('returns empty result when file does not exist', () => {
+    const r = drainTranscript('/no/such/file.jsonl', 0);
+    expect(r.events).toEqual([]);
+    expect(r.newOffset).toBe(0);
+  });
+
+  it('reads complete lines, leaves trailing partial line for next drain', () => {
+    appendLine({ type: 'assistant', uuid: 'u1', message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }] } });
+    // half line at the end (no \n yet)
+    appendFileSync(path, '{"type":"assistant","uuid":"u2"', 'utf8');
+    const r = drainTranscript(path, 0);
+    expect(r.events.length).toBe(1);
+    expect(r.events[0].uuid).toBe('u1');
+    expect(r.pendingTail).toContain('"u2"');
+    // newOffset must point at end of complete line, not the partial tail
+    expect(r.newOffset).toBeLessThan(JSON.stringify({ type: 'assistant', uuid: 'u1', message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }] } }).length + 50);
+  });
+
+  it('continues from newOffset on subsequent drains', () => {
+    appendLine({ type: 'user', uuid: 'u1', message: { role: 'user', content: 'one' } });
+    const r1 = drainTranscript(path, 0);
+    expect(r1.events.length).toBe(1);
+    appendLine({ type: 'assistant', uuid: 'u2', message: { role: 'assistant', content: [{ type: 'text', text: 'two' }] } });
+    const r2 = drainTranscript(path, r1.newOffset);
+    expect(r2.events.length).toBe(1);
+    expect(r2.events[0].uuid).toBe('u2');
+  });
+
+  it('skips malformed JSON lines silently', () => {
+    appendFileSync(path, 'not-json\n', 'utf8');
+    appendLine({ type: 'assistant', uuid: 'u1', message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } });
+    const r = drainTranscript(path, 0);
+    expect(r.events.length).toBe(1);
+    expect(r.events[0].uuid).toBe('u1');
+  });
+
+  it('detects shrinkage (size < lastOffset) and re-reads from 0', () => {
+    // We don't claim to handle full file rotation (rare in practice — Claude
+    // Code keeps one JSONL per session and never truncates), but we DO need
+    // to recover when the file's current size is smaller than the offset we
+    // held — otherwise the next drain would read garbage from a stale offset.
+    appendLine({ type: 'assistant', uuid: 'u1', message: { role: 'assistant', content: [{ type: 'text', text: 'this-is-quite-a-long-payload-here-for-bytes' }] } });
+    const r1 = drainTranscript(path, 0);
+    const fd = openSync(path, 'r+');
+    try { ftruncateSync(fd, 0); } finally { closeSync(fd); }
+    appendLine({ type: 'assistant', uuid: 'u2', message: { role: 'assistant', content: [{ type: 'text', text: 'short' }] } });
+    const r2 = drainTranscript(path, r1.newOffset);
+    expect(r2.events.find(e => e.uuid === 'u2')).toBeDefined();
+  });
+});
+
+describe('pickAssistantTextEvents', () => {
+  it('keeps assistant text events with uuid', () => {
+    const events: TranscriptEvent[] = [
+      { type: 'assistant', uuid: 'a', message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }] } },
+    ];
+    expect(pickAssistantTextEvents(events).map(e => e.uuid)).toEqual(['a']);
+  });
+
+  it('drops user events', () => {
+    const events: TranscriptEvent[] = [
+      { type: 'user', uuid: 'u', message: { role: 'user', content: 'hi' } },
+    ];
+    expect(pickAssistantTextEvents(events)).toEqual([]);
+  });
+
+  it('drops sidechain (sub-agent) events', () => {
+    const events: TranscriptEvent[] = [
+      { type: 'assistant', uuid: 's', message: { role: 'assistant', content: [{ type: 'text', text: 'sub' }] }, ...({ isSidechain: true } as any) },
+    ];
+    expect(pickAssistantTextEvents(events)).toEqual([]);
+  });
+
+  it('drops tool_use-only events (no text block)', () => {
+    const events: TranscriptEvent[] = [
+      { type: 'assistant', uuid: 't', message: { role: 'assistant', content: [{ type: 'tool_use', text: undefined } as any] } },
+    ];
+    expect(pickAssistantTextEvents(events)).toEqual([]);
+  });
+
+  it('drops events without uuid', () => {
+    const events: TranscriptEvent[] = [
+      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'no-uuid' }] } },
+    ];
+    expect(pickAssistantTextEvents(events)).toEqual([]);
+  });
+
+  it('drops the rate_limit API-error record so its text is not forwarded as a reply', () => {
+    // rate_limit is surfaced as a `limited` state, not an assistant answer.
+    const events: TranscriptEvent[] = [
+      { type: 'assistant', uuid: 'rl', isApiErrorMessage: true, error: 'rate_limit', apiErrorStatus: 429, message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your session limit · resets 10:40pm" }] } },
+    ];
+    expect(pickAssistantTextEvents(events)).toEqual([]);
+  });
+
+  it('drops non-rate API-error text because structured terminal handling owns it', () => {
+    const events: TranscriptEvent[] = [
+      { type: 'assistant', uuid: 'se', isApiErrorMessage: true, error: 'server_error', message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 500 internal' }] } },
+    ];
+    expect(pickAssistantTextEvents(events)).toEqual([]);
+  });
+});
+
+describe('isTranscriptRateLimitEvent', () => {
+  it('is true for a rate_limit error record', () => {
+    const ev: TranscriptEvent = { type: 'assistant', uuid: 'r', error: 'rate_limit', apiErrorStatus: 429, isApiErrorMessage: true, message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your session limit · resets 10:40pm" }] } };
+    expect(isTranscriptRateLimitEvent(ev)).toBe(true);
+  });
+
+  it('is true when only apiErrorStatus is 429 (defensive)', () => {
+    const ev: TranscriptEvent = { type: 'assistant', uuid: 'r2', apiErrorStatus: 429, isApiErrorMessage: true, message: { role: 'assistant', content: [] } };
+    expect(isTranscriptRateLimitEvent(ev)).toBe(true);
+  });
+
+  it('is false for a normal assistant reply', () => {
+    const ev: TranscriptEvent = { type: 'assistant', uuid: 'ok', message: { role: 'assistant', content: [{ type: 'text', text: 'here is your answer' }] } };
+    expect(isTranscriptRateLimitEvent(ev)).toBe(false);
+  });
+
+  it('is false for other API errors (server_error, auth, terms-400)', () => {
+    for (const error of ['server_error', 'authentication_failed', 'unknown', 'invalid_request']) {
+      const ev: TranscriptEvent = { type: 'assistant', uuid: 'e', error, isApiErrorMessage: true, message: { role: 'assistant', content: [{ type: 'text', text: 'API Error' }] } };
+      expect(isTranscriptRateLimitEvent(ev), `error=${error}`).toBe(false);
+    }
+  });
+
+  it('is false for the system/turn_duration terminal marker', () => {
+    const ev: TranscriptEvent = { type: 'system', subtype: 'turn_duration', uuid: 'td' };
+    expect(isTranscriptRateLimitEvent(ev)).toBe(false);
+  });
+
+  it('apiErrorMessageText recovers the human retry clock from the record text', () => {
+    const ev: TranscriptEvent = { type: 'assistant', uuid: 'r', error: 'rate_limit', message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your session limit · resets 10:40pm (America/Los_Angeles)" }] } };
+    expect(apiErrorMessageText(ev)).toContain('resets 10:40pm');
+  });
+});
+
+describe('classifyClaudeTerminalEvent', () => {
+  it('classifies the observed unknown + unexpected EOF fixture as retryable failure', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'fixture-error',
+      isApiErrorMessage: true,
+      error: 'unknown',
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'API Error: provider disconnected: unexpected EOF' }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    });
+  });
+
+  it.each([
+    ['authentication_failed', undefined, 'API Error: authentication failed', 'provider_authentication_failed'],
+    ['invalid_request', 400, 'API Error: invalid request', 'provider_invalid_request'],
+    ['permission_error', 403, 'API Error: permission denied', 'provider_permission_denied'],
+    ['unknown', 404, 'API Error: endpoint not found', 'provider_invalid_request'],
+  ])('classifies %s as non-retryable', (error, apiErrorStatus, text, errorCode) => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: `non-retry-${error}`,
+      isApiErrorMessage: true,
+      error,
+      apiErrorStatus,
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode,
+      retryable: false,
+    });
+  });
+
+  it('does not promote an unrecognized unknown API error into an automatic retry', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'unknown-other',
+      isApiErrorMessage: true,
+      error: 'unknown',
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'API Error: something unfamiliar happened' }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'ambiguous',
+      errorCode: 'provider_unknown_error',
+      retryable: false,
+    });
+  });
+
+  it('does not let transient-looking text override an explicit auth failure', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'auth-eof',
+      isApiErrorMessage: true,
+      error: 'authentication_failed',
+      apiErrorStatus: 401,
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'authentication failed after unexpected EOF' }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode: 'provider_authentication_failed',
+      retryable: false,
+    });
+  });
+
+  it('keeps 429 on the existing rate-limit path instead of ordinary recovery', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'rate-limit',
+      isApiErrorMessage: true,
+      error: 'rate_limit',
+      apiErrorStatus: 429,
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'rate limited' }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'rate_limited',
+      errorCode: 'provider_rate_limited',
+      retryable: false,
+    });
+  });
+
+  it.each([
+    ['server_error', 524, 'API Error: upstream timed out'],
+    ['unknown', undefined, 'API Error: 厂商资源问题断连：http2: client connection lost'],
+    ['unknown', undefined, 'API Error: Connection closed mid-response. The response above may be incomplete.'],
+    ['unknown', undefined, 'API Error: InternalServerException: Try your request again.'],
+  ])('classifies verified transient provider shape %s/%s as retryable', (error, apiErrorStatus, text) => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: `transient-${error}-${apiErrorStatus ?? 'none'}`,
+      isApiErrorMessage: true,
+      error,
+      apiErrorStatus,
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+    });
+  });
+});
+
+describe('extractAssistantText / joinAssistantText', () => {
+  it('joins multiple text blocks of one event with blank lines', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'a',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'part-one' },
+          { type: 'tool_use' } as any,
+          { type: 'text', text: 'part-two' },
+        ],
+      },
+    };
+    expect(extractAssistantText(ev)).toBe('part-one\n\npart-two');
+  });
+
+  it('handles bare-string content (legacy schema)', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'a',
+      message: { role: 'assistant', content: 'hi-from-old-schema' as any },
+    };
+    expect(extractAssistantText(ev)).toBe('hi-from-old-schema');
+  });
+
+  it('joinAssistantText filters then concatenates multiple events', () => {
+    const events: TranscriptEvent[] = [
+      { type: 'user', uuid: 'u1', message: { role: 'user', content: 'q' } },
+      { type: 'assistant', uuid: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: 'first' }] } },
+      { type: 'assistant', uuid: 'a2', message: { role: 'assistant', content: [{ type: 'text', text: 'second' }] } },
+    ];
+    expect(joinAssistantText(events)).toBe('first\n\nsecond');
+  });
+
+  it('returns empty string for empty input', () => {
+    expect(joinAssistantText([])).toBe('');
+  });
+});
+
+describe('findLatestJsonl', () => {
+  let projectDir: string;
+
+  beforeEach(() => {
+    projectDir = mkdtempSync(join(tmpdir(), 'bmx-latest-'));
+  });
+
+  afterEach(() => {
+    rmSync(projectDir, { recursive: true, force: true });
+  });
+
+  function writeJsonl(name: string, mtimeSec: number): string {
+    const full = join(projectDir, name);
+    writeFileSync(full, '');
+    utimesSync(full, mtimeSec, mtimeSec);
+    return full;
+  }
+
+  it('returns null when the directory does not exist', () => {
+    expect(findLatestJsonl('/no/such/dir')).toBeNull();
+  });
+
+  it('returns null when the directory has no jsonl files', () => {
+    writeFileSync(join(projectDir, 'README.md'), '');
+    writeFileSync(join(projectDir, 'something.txt'), '');
+    expect(findLatestJsonl(projectDir)).toBeNull();
+  });
+
+  it('picks the most recently modified jsonl', () => {
+    writeJsonl('old.jsonl', 1_000_000);
+    const newer = writeJsonl('new.jsonl', 2_000_000);
+    writeJsonl('older.jsonl', 500_000);
+    expect(findLatestJsonl(projectDir)).toBe(newer);
+  });
+
+  it('detects /clear scenario: a new jsonl appears, latest result follows it', () => {
+    const original = writeJsonl('aaa.jsonl', 1_000_000);
+    expect(findLatestJsonl(projectDir)).toBe(original);
+    // user runs /clear → Claude Code creates a brand-new sessionId.jsonl
+    const fresh = writeJsonl('bbb.jsonl', 2_000_000);
+    expect(findLatestJsonl(projectDir)).toBe(fresh);
+    expect(findLatestJsonl(projectDir)).not.toBe(original);
+  });
+
+  it('ignores non-.jsonl files even when they are newer', () => {
+    writeJsonl('session.jsonl', 1_000_000);
+    const txt = join(projectDir, 'note.txt');
+    writeFileSync(txt, '');
+    utimesSync(txt, 5_000_000, 5_000_000);
+    expect(findLatestJsonl(projectDir)).toBe(join(projectDir, 'session.jsonl'));
+  });
+
+  it('skips candidates rejected by acceptCandidate (sibling-pane hijack guard)', () => {
+    const ours = writeJsonl('ours.jsonl', 1_000_000);
+    const sibling = writeJsonl('sibling.jsonl', 5_000_000);
+    const trustSet = new Set([basename(ours, '.jsonl')]);
+    const accept = (p: string) => trustSet.has(basename(p, '.jsonl'));
+    // Without the predicate, sibling wins the mtime race.
+    expect(findLatestJsonl(projectDir)).toBe(sibling);
+    // With the predicate, the sibling is rejected and we stay on `ours`.
+    expect(findLatestJsonl(projectDir, { acceptCandidate: accept })).toBe(ours);
+  });
+
+  it('returns null when acceptCandidate rejects every jsonl', () => {
+    writeJsonl('a.jsonl', 1_000_000);
+    writeJsonl('b.jsonl', 2_000_000);
+    expect(findLatestJsonl(projectDir, { acceptCandidate: () => false })).toBeNull();
+  });
+});
+
+describe('findJsonlContainingFingerprint', () => {
+  let projectDir: string;
+
+  beforeEach(() => {
+    projectDir = mkdtempSync(join(tmpdir(), 'bmx-fp-'));
+  });
+
+  afterEach(() => {
+    rmSync(projectDir, { recursive: true, force: true });
+  });
+
+  function writeJsonl(name: string, body: string, mtimeSec = 1_000_000): string {
+    const full = join(projectDir, name);
+    writeFileSync(full, body);
+    utimesSync(full, mtimeSec, mtimeSec);
+    return full;
+  }
+
+  it('returns null when nothing contains the fingerprint', () => {
+    writeJsonl('a.jsonl', '{"type":"user","message":{"role":"user","content":"hello world"}}\n');
+    expect(findJsonlContainingFingerprint(projectDir, 'lark-specific-string')).toBeNull();
+  });
+
+  it('finds the file whose payload includes the fingerprint', () => {
+    writeJsonl('a.jsonl', '{"type":"user","message":{"role":"user","content":"random chatter"}}\n');
+    const target = writeJsonl('b.jsonl', '{"type":"user","message":{"role":"user","content":"please review the new patch"}}\n');
+    expect(findJsonlContainingFingerprint(projectDir, 'please review the new patch')).toBe(target);
+  });
+
+  it('skips the excluded path (the current watcher target)', () => {
+    const userEv = '{"type":"user","message":{"role":"user","content":"please review the new patch"}}\n';
+    const current = writeJsonl('current.jsonl', userEv, 1_000_000);
+    const newer = writeJsonl('newer.jsonl', userEv, 2_000_000);
+    expect(findJsonlContainingFingerprint(projectDir, 'please review the new patch', current)).toBe(newer);
+  });
+
+  it('prefers the newer jsonl when multiple contain the fingerprint', () => {
+    const userEv = '{"type":"user","message":{"role":"user","content":"hello world"}}\n';
+    writeJsonl('older.jsonl', userEv, 1_000_000);
+    const newer = writeJsonl('newer.jsonl', userEv, 5_000_000);
+    expect(findJsonlContainingFingerprint(projectDir, 'hello world')).toBe(newer);
+  });
+
+  it('returns null when the directory does not exist', () => {
+    expect(findJsonlContainingFingerprint('/no/such/dir', 'anything')).toBeNull();
+  });
+
+  it('returns null on empty fingerprint (defensive — would otherwise match every file)', () => {
+    writeJsonl('a.jsonl', 'whatever');
+    expect(findJsonlContainingFingerprint(projectDir, '')).toBeNull();
+  });
+
+  it('matches across JSON-escaped newlines (multi-line Lark message)', () => {
+    // Lark message has real newlines: "please\nreview\nthe patch"
+    // makeFingerprint() collapses → "please review the patch"
+    // Claude jsonl writes content as a JSON-encoded string, so newlines are
+    // serialized as \n on disk. Raw includes() would miss; parse + normalise
+    // must succeed.
+    const fp = 'please review the patch';
+    const writer = (path: string) => {
+      const ev = { type: 'user', uuid: 'u1', message: { role: 'user', content: 'please\nreview\nthe patch — extra context appended' } };
+      writeFileSync(path, JSON.stringify(ev) + '\n');
+    };
+    const target = join(projectDir, 'multiline.jsonl');
+    writer(target);
+    utimesSync(target, 1_000_000, 1_000_000);
+    expect(findJsonlContainingFingerprint(projectDir, fp)).toBe(target);
+  });
+
+  it('matches user content stored as an array of blocks', () => {
+    // Some user events use the array-of-blocks form: content: [{type:'text',text:'...'}]
+    // stringifyUserContent must extract text from the blocks before compare.
+    const fp = 'review my patch';
+    const ev = {
+      type: 'user',
+      uuid: 'u2',
+      message: {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'review my patch please' },
+          { type: 'image', source: { type: 'base64', data: '...' } },
+        ],
+      },
+    };
+    const target = join(projectDir, 'array-content.jsonl');
+    writeFileSync(target, JSON.stringify(ev) + '\n');
+    utimesSync(target, 1_000_000, 1_000_000);
+    expect(findJsonlContainingFingerprint(projectDir, fp)).toBe(target);
+  });
+
+  it('does NOT match fingerprint that only appears in non-user events', () => {
+    // A jsonl where the fingerprint string appears in an assistant or
+    // system event but never in a user event must not be selected — we
+    // only key off user input to identify the active session.
+    const fp = 'spurious-fingerprint';
+    const target = join(projectDir, 'red-herring.jsonl');
+    writeFileSync(
+      target,
+      JSON.stringify({ type: 'user', uuid: 'u', message: { role: 'user', content: 'completely different' } }) + '\n' +
+      JSON.stringify({ type: 'assistant', uuid: 'a', message: { role: 'assistant', content: [{ type: 'text', text: 'spurious-fingerprint mentioned in reply' }] } }) + '\n',
+    );
+    utimesSync(target, 1_000_000, 1_000_000);
+    expect(findJsonlContainingFingerprint(projectDir, fp)).toBeNull();
+  });
+
+  it('matches queue-operation enqueue content only when explicitly enabled', () => {
+    const fp = 'queued follow-up';
+    const target = join(projectDir, 'queued.jsonl');
+    writeFileSync(
+      target,
+      JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content: 'queued follow-up for Claude' }) + '\n',
+    );
+    utimesSync(target, 1_000_000, 1_000_000);
+
+    expect(findJsonlContainingFingerprint(projectDir, fp)).toBeNull();
+    expect(findJsonlContainingFingerprint(projectDir, fp, { includeQueueOperations: true })).toBe(target);
+  });
+
+  it('can ignore stale jsonl files by mtime', () => {
+    writeJsonl(
+      'old.jsonl',
+      '{"type":"user","message":{"role":"user","content":"repeatable short prompt"}}\n',
+      1_000_000,
+    );
+    const fresh = writeJsonl(
+      'fresh.jsonl',
+      '{"type":"user","message":{"role":"user","content":"repeatable short prompt"}}\n',
+      2_000_000,
+    );
+
+    expect(findJsonlContainingFingerprint(projectDir, 'repeatable short prompt', {
+      minMtimeMs: 1_500_000_000,
+    })).toBe(fresh);
+  });
+
+  it('skips malformed jsonl lines gracefully', () => {
+    // A half-flushed line at the head + a real user event after it.
+    const fp = 'real fingerprint';
+    const target = join(projectDir, 'mixed.jsonl');
+    writeFileSync(
+      target,
+      'this-is-not-json-at-all\n' +
+      JSON.stringify({ type: 'user', uuid: 'u', message: { role: 'user', content: 'real fingerprint here' } }) + '\n',
+    );
+    utimesSync(target, 1_000_000, 1_000_000);
+    expect(findJsonlContainingFingerprint(projectDir, fp)).toBe(target);
+  });
+
+  it('does not hijack on sibling pane traffic in the same cwd', () => {
+    const userPane = writeJsonl(
+      'user-session.jsonl',
+      '{"type":"user","message":{"role":"user","content":"please run the bridge tests"}}\n',
+      2_000_000,
+    );
+    writeJsonl(
+      'sibling-pane.jsonl',
+      '{"type":"user","message":{"role":"user","content":"refactor the UI components"}}\n'.repeat(50),
+      3_000_000,
+    );
+    expect(findJsonlContainingFingerprint(projectDir, 'please run the bridge tests')).toBe(userPane);
+  });
+});
+
+// ─── Bridge rotation integration ───────────────────────────────────────────
+//
+// Reproduces the P1 case from review of 0926f3d: when sessionId rotation
+// switches the watched jsonl mid-flight, any unread bytes on the OLD path
+// must still drive an emit. The fix is two-part:
+//   1. drainPathInto(oldPath) before switching — pulls trailing events into
+//      the queue so they participate in attribution.
+//   2. BridgePendingTurn.sourceJsonlPath stamped at start-time — lets emit-
+//      time uuid → text resolution read from the original transcript even
+//      after the global current path has moved.
+// The test exercises both via the real filesystem (no fs.watch / IPC).
+import { BridgeTurnQueue } from '../src/services/bridge-turn-queue.js';
+
+describe('bridge rotation: drain + emit before switch', () => {
+  it('does not lose an in-flight reply when pid resolver switches paths', () => {
+    const oldPath = join(dir, 'old-session.jsonl');
+    const newPath = join(dir, 'new-session.jsonl');
+    writeFileSync(oldPath, '');
+    writeFileSync(newPath, '');
+
+    const queue = new BridgeTurnQueue();
+    queue.mark('t1', 'hello bridge');
+
+    // Claude writes the user event AND the assistant reply to the OLD jsonl.
+    // The fallback poller hasn't seen the assistant yet — only the user
+    // event has been ingested. Then a sessionId rotation flips the pid
+    // file, the resolver wants to switch to newPath, and the assistant
+    // line is "still" on oldPath.
+    appendFileSync(
+      oldPath,
+      JSON.stringify({ type: 'user', uuid: 'u1', message: { role: 'user', content: 'hello bridge — please reply' } }) + '\n',
+      'utf8',
+    );
+    let oldOffset = 0;
+    {
+      const r = drainTranscript(oldPath, oldOffset);
+      queue.ingest(r.events, oldPath);
+      oldOffset = r.newOffset;
+    }
+    // Turn should be started but text not yet known.
+    const startedTurn = queue.peek().find(t => t.turnId === 't1');
+    expect(startedTurn?.started).toBe(true);
+    expect(startedTurn?.sourceJsonlPath).toBe(oldPath);
+    expect(startedTurn?.assistantUuids).toEqual([]);
+
+    // Now Claude appends the assistant text to oldPath — fs.watch missed
+    // it (best-effort). The pid resolver fires before the fallback poll.
+    appendFileSync(
+      oldPath,
+      JSON.stringify({ type: 'assistant', uuid: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: 'reply text from rotated jsonl' }] } }) + '\n',
+      'utf8',
+    );
+
+    // Pre-switch protocol: drain remaining bytes on oldPath one last time.
+    {
+      const r = drainTranscript(oldPath, oldOffset);
+      queue.ingest(r.events, oldPath);
+    }
+
+    // Switch to newPath: future ingests stamp newPath, but emits for
+    // turns started on oldPath must still resolve there.
+    const ready = queue.drainEmittable();
+    expect(ready).toHaveLength(1);
+    expect(ready[0].sourceJsonlPath).toBe(oldPath);
+    expect(ready[0].assistantUuids).toEqual(['a1']);
+
+    // Emit-time text resolution: read the source path of each turn, NOT
+    // the global current path. Without sourceJsonlPath, draining newPath
+    // here would return zero events and the reply would be lost.
+    const drainedFromSource = drainTranscript(ready[0].sourceJsonlPath!, 0);
+    const matched = drainedFromSource.events.filter(e => e.uuid && ready[0].assistantUuids.includes(e.uuid));
+    expect(joinAssistantText(matched)).toBe('reply text from rotated jsonl');
+  });
+
+  it('rotation drain+switch does NOT emit ready turns; only idle path emits', () => {
+    // Codex review of 4036fcc P1.1: drainEmittable's contract is "has visible
+    // text", not "model finished". If the rotation helper invoked emit
+    // during a non-idle fs.watch / poll tick, half-finished assistant text
+    // would be flushed to Lark prematurely. The rotation helpers must only
+    // ingest into the queue; emit is reserved for idle-driven ticks.
+    const oldPath = join(dir, 'old-session.jsonl');
+    writeFileSync(oldPath, '');
+
+    const queue = new BridgeTurnQueue();
+    queue.mark('t1', 'hello bridge');
+
+    // Mid-turn snapshot: user landed + a *partial* assistant text block.
+    // (Claude often emits multiple assistant events within one turn —
+    // drainEmittable can't distinguish "finished" from "still streaming".)
+    appendFileSync(
+      oldPath,
+      JSON.stringify({ type: 'user', uuid: 'u1', message: { role: 'user', content: 'hello bridge — please reply' } }) + '\n' +
+      JSON.stringify({ type: 'assistant', uuid: 'a-partial', message: { role: 'assistant', content: [{ type: 'text', text: 'thinking...' }] } }) + '\n',
+      'utf8',
+    );
+
+    // Simulate the rotation-helper code path: drain into queue, do NOT
+    // call drainEmittable. The original-design "emit only at idle" rule
+    // means publication is gated on the idle handler.
+    const r = drainTranscript(oldPath, 0);
+    queue.ingest(r.events, oldPath);
+
+    // Until idle fires, the turn must remain in the queue (not be popped
+    // and emitted by the rotation tick).
+    expect(queue.peek()).toHaveLength(1);
+    expect(queue.peek()[0].started).toBe(true);
+    expect(queue.peek()[0].assistantUuids).toEqual(['a-partial']);
+  });
+
+  it('keeps polling old path until in-flight turn arrives, then emits', () => {
+    // Codex P1.2: after rotation switches the primary path away, an
+    // in-flight turn whose assistant text hasn't landed yet must still
+    // get its append picked up. Modeled here as the secondary-path
+    // polling loop the worker uses: drain each retained path on every
+    // tick, queue ingests with that path as the source stamp.
+    const oldPath = join(dir, 'old-session.jsonl');
+    const newPath = join(dir, 'new-session.jsonl');
+    writeFileSync(oldPath, '');
+    writeFileSync(newPath, '');
+
+    const queue = new BridgeTurnQueue();
+    queue.mark('t1', 'hello bridge');
+
+    // tick 1 — user lands on old path; turn starts there.
+    appendFileSync(
+      oldPath,
+      JSON.stringify({ type: 'user', uuid: 'u1', message: { role: 'user', content: 'hello bridge — please reply' } }) + '\n',
+      'utf8',
+    );
+    let oldOffset = 0;
+    {
+      const r = drainTranscript(oldPath, oldOffset);
+      queue.ingest(r.events, oldPath);
+      oldOffset = r.newOffset;
+    }
+    // Rotation: pid file now points at newPath. We drain old once more
+    // (still no assistant) and retain it as a secondary path because the
+    // turn started there.
+    {
+      const r = drainTranscript(oldPath, oldOffset);
+      queue.ingest(r.events, oldPath);
+      oldOffset = r.newOffset;
+    }
+    const secondaryPaths = new Map<string, number>();
+    if (queue.peek().some(t => t.sourceJsonlPath === oldPath)) {
+      secondaryPaths.set(oldPath, oldOffset);
+    }
+    expect(secondaryPaths.has(oldPath)).toBe(true);
+
+    // tick 2 — assistant finally lands on old path (Claude finished
+    // mid-rotation). The secondary-path drain picks it up.
+    appendFileSync(
+      oldPath,
+      JSON.stringify({ type: 'assistant', uuid: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: 'late but valid reply' }] } }) + '\n',
+      'utf8',
+    );
+    for (const [path, off] of secondaryPaths) {
+      const r = drainTranscript(path, off);
+      queue.ingest(r.events, path);
+      secondaryPaths.set(path, r.newOffset);
+    }
+
+    // Idle tick: emit. Turn resolves text from oldPath via sourceJsonlPath.
+    const ready = queue.drainEmittable();
+    expect(ready).toHaveLength(1);
+    expect(ready[0].sourceJsonlPath).toBe(oldPath);
+    const drained = drainTranscript(ready[0].sourceJsonlPath!, 0);
+    const matched = drained.events.filter(e => e.uuid && ready[0].assistantUuids.includes(e.uuid));
+    expect(joinAssistantText(matched)).toBe('late but valid reply');
+  });
+});
+
+// ─── Fingerprint tool_result false-positive guard ─────────────────────────
+//
+// Live failure observed: user sent "hello" via Lark to an /adopt-bridged
+// Claude. Bridge fingerprint fallback found "hello" in an unrelated
+// sibling jsonl whose tool_result block contained log output mentioning
+// "hello", and switched the watcher away from the correct adopt target
+// — final_output was lost. The fix is to skip pure tool_result user
+// events in both fingerprint scanners, matching what
+// BridgeTurnQueue.ingest already does.
+
+describe('fingerprint search: tool_result content must not false-match', () => {
+  it('jsonlContainsFingerprint ignores tool_result blocks', () => {
+    const path = join(dir, 'sibling.jsonl');
+    appendFileSync(
+      path,
+      // role:user with content as array of tool_result blocks. The
+      // tool_result.content includes the substring "hello" (e.g. a log
+      // line that was the result of an earlier Bash tool_use). No real
+      // user typed "hello" here, so the fingerprint must NOT match.
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 't1', content: 'log dump line that mentions hello and other stuff' },
+          ],
+        },
+      }) + '\n',
+      'utf8',
+    );
+    expect(jsonlContainsFingerprint(path, 'hello')).toBe(false);
+  });
+
+  it('findJsonlContainingFingerprint skips tool_result-only sibling jsonls', () => {
+    const sibling = join(dir, 'sibling-tool.jsonl');
+    const realUser = join(dir, 'real-user.jsonl');
+    appendFileSync(
+      sibling,
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 't1', content: 'noise mentioning hello in tool output' },
+          ],
+        },
+      }) + '\n',
+      'utf8',
+    );
+    // A *real* user event in another file with the actual fingerprint —
+    // this is what should be returned, not the tool_result-only sibling.
+    appendFileSync(
+      realUser,
+      JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: 'hello bridge' },
+      }) + '\n',
+      'utf8',
+    );
+    expect(findJsonlContainingFingerprint(dir, 'hello')).toBe(realUser);
+  });
+
+  it('jsonlContainsFingerprint still matches genuine string-content user events', () => {
+    const path = join(dir, 'genuine-user.jsonl');
+    appendFileSync(
+      path,
+      JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: 'hello bridge — typed by the user' },
+      }) + '\n',
+      'utf8',
+    );
+    expect(jsonlContainsFingerprint(path, 'hello')).toBe(true);
+  });
+});
+
+// ─── /clear in-process rotation: bridge must follow new jsonl ─────────────
+//
+// Live failure: pid file's sessionId is set ONCE at process start. Verified
+// empirically on Claude Code 2.1.123: in-pane `/clear` rotates to a new
+// jsonl in the same project dir, refreshes the pid file's `updatedAt` /
+// `status`, but does NOT rewrite `sessionId`. So pid resolver returning
+// 'same' is NOT proof that no rotation happened. The fingerprint fallback
+// must run anyway, with the per-event timestamp guard protecting against
+// short fingerprints matching old user lines in unrelated sibling jsonls.
+//
+// (`--resume` is a fresh spawn and DOES rewrite the pid file's sessionId,
+// so it's covered by the pid resolver alone — separate scope from this
+// test.)
+
+describe('fingerprint fallback: /clear rotation + short fingerprint guard', () => {
+  it('finds the new post-/clear jsonl despite pid file still pointing at old sessionId', () => {
+    const oldPath = join(dir, 'old-session-d82e0b04.jsonl');
+    const newPath = join(dir, 'new-session-dd529008.jsonl');
+    // Pre-populate old session with the prior turn (pid resolver still
+    // points here because /clear doesn't update the pid file).
+    appendFileSync(
+      oldPath,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:02.778Z',
+        message: { role: 'user', content: 'Hello again,how are you' },
+      }) + '\n' +
+      JSON.stringify({
+        type: 'assistant',
+        uuid: 'a1',
+        timestamp: '2026-04-29T05:45:06.133Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Doing well' }] },
+      }) + '\n',
+      'utf8',
+    );
+    // After /clear, Claude rotates to a new jsonl. First lines are the
+    // synthetic local-command-caveat + command-name wrappers, then the
+    // real user prompt + assistant reply.
+    appendFileSync(
+      newPath,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.092Z',
+        isMeta: true,
+        message: { role: 'user', content: '<local-command-caveat>noise</local-command-caveat>' },
+      }) + '\n' +
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.027Z',
+        message: { role: 'user', content: '<command-name>/clear</command-name>' },
+      }) + '\n' +
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:32.224Z',
+        message: { role: 'user', content: 'test' },
+      }) + '\n' +
+      JSON.stringify({
+        type: 'assistant',
+        uuid: 'a2',
+        timestamp: '2026-04-29T05:45:34.239Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'reply after clear' }] },
+      }) + '\n',
+      'utf8',
+    );
+
+    // Lark turn's mark time was right before the user pressed enter on
+    // "test" (~05:45:32 UTC). The fallback must find "test" in newPath
+    // and NOT in oldPath (whose user events are older).
+    const markTimeMs = Date.parse('2026-04-29T05:45:30.000Z');
+    const matched = findJsonlContainingFingerprint(dir, 'test', {
+      excludePath: oldPath,
+      minEventTimestampMs: markTimeMs - 5_000,
+      includeQueueOperations: true,
+    });
+    expect(matched).toBe(newPath);
+  });
+
+  it('time guard rejects sibling jsonl whose stale user event coincidentally contains the fingerprint', () => {
+    const watched = join(dir, 'watched.jsonl');
+    const sibling = join(dir, 'sibling-old.jsonl');
+    // Watched (current) path is empty — no user events yet in this turn.
+    writeFileSync(watched, '');
+    // Sibling jsonl (another Claude pane) has an OLD user event whose
+    // content contains "test". Without the timestamp guard the
+    // fingerprint scan would hijack us into the wrong file.
+    appendFileSync(
+      sibling,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T03:00:00.000Z', // hours before mark
+        message: { role: 'user', content: 'test' },
+      }) + '\n',
+      'utf8',
+    );
+    const markTimeMs = Date.parse('2026-04-29T05:45:30.000Z');
+    const matched = findJsonlContainingFingerprint(dir, 'test', {
+      excludePath: watched,
+      minEventTimestampMs: markTimeMs - 5_000,
+      includeQueueOperations: true,
+    });
+    expect(matched).toBeNull();
+  });
+
+  it('jsonlContainsFingerprint also honours minEventTimestampMs', () => {
+    const path = join(dir, 'mixed.jsonl');
+    appendFileSync(
+      path,
+      // Old hit: should be rejected by time guard.
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T03:00:00.000Z',
+        message: { role: 'user', content: 'hello world from yesterday' },
+      }) + '\n' +
+      // Fresh hit: this is the one we want.
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:32.000Z',
+        message: { role: 'user', content: 'hello world fresh' },
+      }) + '\n',
+      'utf8',
+    );
+    const markTimeMs = Date.parse('2026-04-29T05:45:30.000Z');
+    expect(jsonlContainsFingerprint(path, 'hello world', {
+      minEventTimestampMs: markTimeMs - 5_000,
+    })).toBe(true);
+    // Bumping mark to after both events disqualifies both.
+    expect(jsonlContainsFingerprint(path, 'hello world', {
+      minEventTimestampMs: Date.parse('2026-04-29T06:00:00.000Z'),
+    })).toBe(false);
+  });
+});
+
+// ─── isMeaningfulUserEvent / extractLastAssistantTurn ──────────────────────
+//
+// Powers the /adopt preamble: when /adopt fires, the bridge baselines the
+// transcript and surfaces the last completed user → assistant exchange to
+// Lark so the user can pick up the conversation without scrolling the
+// pane. The predicate centralises filtering of internal events
+// (tool_result, isMeta, isCompactSummary, sidechain, slash-command
+// wrappers) so the queue and the extractor never disagree about what
+// counts as "real user input".
+
+function userEv(content: any, extra: Record<string, unknown> = {}): TranscriptEvent {
+  return { type: 'user', message: { role: 'user', content }, ...extra } as TranscriptEvent;
+}
+function assistantEv(text: string, extra: Record<string, unknown> = {}): TranscriptEvent {
+  return {
+    type: 'assistant',
+    uuid: `a-${text.slice(0, 8)}`,
+    message: { role: 'assistant', content: [{ type: 'text', text }] },
+    ...extra,
+  } as TranscriptEvent;
+}
+function assistantToolUseEv(): TranscriptEvent {
+  return {
+    type: 'assistant',
+    uuid: 'a-tool-use',
+    message: { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read' }] as any },
+  } as TranscriptEvent;
+}
+function toolResultUserEv(): TranscriptEvent {
+  return {
+    type: 'user',
+    message: {
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 't1', content: 'tool output' }] as any,
+    },
+  } as TranscriptEvent;
+}
+
+describe('isMeaningfulUserEvent', () => {
+  it('accepts plain string-content user events', () => {
+    expect(isMeaningfulUserEvent(userEv('hello there'))).toBe(true);
+  });
+  it('rejects pure tool_result user events', () => {
+    expect(isMeaningfulUserEvent(toolResultUserEv())).toBe(false);
+  });
+  it('rejects events flagged with isMeta', () => {
+    expect(isMeaningfulUserEvent(userEv('meta noise', { isMeta: true }))).toBe(false);
+  });
+  it('rejects events flagged with isCompactSummary', () => {
+    expect(isMeaningfulUserEvent(userEv('summary blob', { isCompactSummary: true }))).toBe(false);
+  });
+  it('rejects sidechain user events', () => {
+    expect(isMeaningfulUserEvent(userEv('sub-agent input', { isSidechain: true }))).toBe(false);
+  });
+  it('rejects empty / whitespace-only content', () => {
+    expect(isMeaningfulUserEvent(userEv(''))).toBe(false);
+    expect(isMeaningfulUserEvent(userEv('   \n  '))).toBe(false);
+  });
+  it('rejects slash-command wrappers even without isMeta flag', () => {
+    expect(isMeaningfulUserEvent(userEv('<command-name>/clear</command-name>'))).toBe(false);
+    expect(isMeaningfulUserEvent(userEv('<local-command-caveat>note</local-command-caveat>'))).toBe(false);
+    expect(isMeaningfulUserEvent(userEv('<command-message>...</command-message>'))).toBe(false);
+  });
+  it('rejects assistant-role events', () => {
+    expect(isMeaningfulUserEvent(assistantEv('hi'))).toBe(false);
+  });
+});
+
+describe('extractLastAssistantTurn', () => {
+  it('happy path: real prompt + multi-block assistant text + interleaved tool_use', () => {
+    const turn = extractLastAssistantTurn([
+      userEv('first prompt'),
+      assistantEv('first reply'),
+      userEv('second prompt — the latest'),
+      assistantEv('thinking it through'),
+      assistantToolUseEv(),
+      toolResultUserEv(),
+      assistantEv('here is the answer'),
+    ]);
+    expect(turn).not.toBeNull();
+    expect(turn!.userText).toBe('second prompt — the latest');
+    expect(turn!.assistantText).toBe('thinking it through\n\nhere is the answer');
+  });
+
+  it('returns null when last user prompt has no visible assistant text yet', () => {
+    // Mid-tool-use snapshot — Claude is busy when /adopt fired. We don't
+    // want to publish a half-formed turn ("(空)"), so return null and
+    // suppress the preamble.
+    const turn = extractLastAssistantTurn([
+      userEv('first prompt'),
+      assistantEv('first reply'),
+      userEv('second prompt'),
+      assistantToolUseEv(),
+      toolResultUserEv(),
+    ]);
+    expect(turn).toBeNull();
+  });
+
+  it('filters out isMeta / sidechain / wrapper noise when picking the last user', () => {
+    const turn = extractLastAssistantTurn([
+      userEv('genuine prompt'),
+      assistantEv('reply A'),
+      // Slash command + caveat: must NOT be treated as a fresh user turn.
+      userEv('<command-name>/clear</command-name>'),
+      userEv('<local-command-caveat>noise</local-command-caveat>', { isMeta: true }),
+      // Sidechain assistant message: must NOT be folded into the parent turn.
+      assistantEv('sub-agent reply', { isSidechain: true }),
+      // Continuation of the genuine prompt.
+      assistantEv('reply B'),
+    ]);
+    expect(turn).not.toBeNull();
+    expect(turn!.userText).toBe('genuine prompt');
+    expect(turn!.assistantText).toBe('reply A\n\nreply B');
+  });
+
+  it('regression: tool_result-only user after assistant text does NOT reset the turn', () => {
+    // The same false-reset bug pattern that motivated isPureToolResultUserEvent
+    // in the bridge queue. Here too, the extractor must keep accumulating.
+    const turn = extractLastAssistantTurn([
+      userEv('the prompt'),
+      assistantEv('first chunk'),
+      assistantToolUseEv(),
+      toolResultUserEv(), // <-- intra-turn machinery, not a new turn
+      assistantEv('second chunk'),
+    ]);
+    expect(turn).not.toBeNull();
+    expect(turn!.userText).toBe('the prompt');
+    expect(turn!.assistantText).toBe('first chunk\n\nsecond chunk');
+  });
+
+  it('returns null on empty events list / no meaningful user', () => {
+    expect(extractLastAssistantTurn([])).toBeNull();
+    expect(extractLastAssistantTurn([assistantEv('orphan reply')])).toBeNull();
+    expect(extractLastAssistantTurn([toolResultUserEv(), assistantEv('orphan')])).toBeNull();
+  });
+});
+
+// ─── findJsonlContainingFingerprint: acceptCandidate skip-and-continue ─────
+//
+// Sibling-pane hijack guard wants to reject candidates whose sessionId
+// isn't trusted. The newest jsonl in the project dir is usually the busy
+// sibling, so the scanner must keep going past a rejected candidate to find
+// a legitimate older one (e.g. a fresh /clear-induced jsonl).
+describe('findJsonlContainingFingerprint: acceptCandidate', () => {
+  it('skips a rejected candidate and returns a later valid one', () => {
+    const newer = join(dir, 'newer.jsonl');
+    const older = join(dir, 'older.jsonl');
+    appendFileSync(
+      newer,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.092Z',
+        message: { role: 'user', content: 'test' },
+      }) + '\n',
+      'utf8',
+    );
+    appendFileSync(
+      older,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:30:00.000Z',
+        message: { role: 'user', content: 'test' },
+      }) + '\n',
+      'utf8',
+    );
+    // Make `newer.jsonl` win the mtime sort but reject it via the
+    // callback. Expect the scanner to fall through to `older.jsonl`.
+    const future = Date.now() / 1000 + 60;
+    utimesSync(newer, future, future);
+    utimesSync(older, future - 30, future - 30);
+
+    const got = findJsonlContainingFingerprint(dir, 'test', {
+      acceptCandidate: (path) => path === older,
+    });
+    expect(got).toBe(older);
+  });
+
+  it('returns null when every fingerprint match is rejected', () => {
+    appendFileSync(
+      path,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.092Z',
+        message: { role: 'user', content: 'test' },
+      }) + '\n',
+      'utf8',
+    );
+    const got = findJsonlContainingFingerprint(dir, 'test', {
+      acceptCandidate: () => false,
+    });
+    expect(got).toBeNull();
+  });
+
+  it('default behaviour preserved when acceptCandidate is omitted', () => {
+    appendFileSync(
+      path,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.092Z',
+        message: { role: 'user', content: 'test' },
+      }) + '\n',
+      'utf8',
+    );
+    const got = findJsonlContainingFingerprint(dir, 'test');
+    expect(got).toBe(path);
+  });
+});
+
+// ─── readFirstEventTimestamp ───────────────────────────────────────────────
+describe('readFirstEventTimestamp', () => {
+  it('returns the first parseable timestamp from a top-level field', () => {
+    appendFileSync(
+      path,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.091Z',
+        message: { role: 'user', content: 'hello' },
+      }) + '\n',
+      'utf8',
+    );
+    expect(readFirstEventTimestamp(path)).toBe(Date.parse('2026-04-29T05:45:14.091Z'));
+  });
+
+  it('falls through to snapshot.timestamp for file-history-snapshot leading event', () => {
+    // Mirrors Claude Code's actual emit order: file-history-snapshot at the
+    // top (no top-level timestamp; it lives under .snapshot.timestamp),
+    // then SessionStart with a top-level timestamp.
+    appendFileSync(
+      path,
+      JSON.stringify({
+        type: 'file-history-snapshot',
+        snapshot: { timestamp: '2026-04-29T05:45:14.092Z' },
+      }) + '\n' +
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.200Z',
+        attachment: { hookName: 'SessionStart:clear' },
+      }) + '\n',
+      'utf8',
+    );
+    expect(readFirstEventTimestamp(path)).toBe(Date.parse('2026-04-29T05:45:14.092Z'));
+  });
+
+  it('returns undefined when the file is missing or unreadable', () => {
+    expect(readFirstEventTimestamp(join(dir, 'nope.jsonl'))).toBeUndefined();
+  });
+
+  it('returns undefined when the leading chunk has no parseable timestamp', () => {
+    appendFileSync(path, '{"type":"unknown","no":"timestamp"}\n', 'utf8');
+    expect(readFirstEventTimestamp(path)).toBeUndefined();
+  });
+});
+
+// ─── findJsonlsContainingExactContent ──────────────────────────────────────
+//
+// The unknown-sid /clear recovery path must accept ONLY candidates whose
+// user/queue events normalise to the pending Lark turn's *full* normalised
+// content — substring matches (the failure mode of the existing fingerprint
+// scanner) are explicitly off-limits, so "test" must not match "run tests"
+// across sibling pane jsonls. The search must also collect every match so
+// the caller can abstain when more than one untrusted file looks valid.
+describe('findJsonlsContainingExactContent', () => {
+  it('returns the single matching path when exactly one jsonl has the exact content', () => {
+    const a = join(dir, 'a.jsonl');
+    const b = join(dir, 'b.jsonl');
+    appendFileSync(
+      a,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.092Z',
+        message: { role: 'user', content: 'who are you' },
+      }) + '\n',
+      'utf8',
+    );
+    appendFileSync(
+      b,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.092Z',
+        message: { role: 'user', content: 'something else entirely' },
+      }) + '\n',
+      'utf8',
+    );
+    const got = findJsonlsContainingExactContent(dir, 'who are you');
+    expect(got).toEqual([a]);
+  });
+
+  it('rejects substring-only matches: "test" does NOT match "run tests" in a sibling jsonl', () => {
+    const sibling = join(dir, 'sibling.jsonl');
+    appendFileSync(
+      sibling,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.092Z',
+        message: { role: 'user', content: 'run tests' },
+      }) + '\n' +
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:45:14.193Z',
+        message: { role: 'user', content: 'test bridge' },
+      }) + '\n',
+      'utf8',
+    );
+    expect(findJsonlsContainingExactContent(dir, 'test')).toEqual([]);
+  });
+
+  it('returns ALL exact matches when multiple files contain the same normalised content (caller abstains)', () => {
+    const a = join(dir, 'a.jsonl');
+    const b = join(dir, 'b.jsonl');
+    for (const p of [a, b]) {
+      appendFileSync(
+        p,
+        JSON.stringify({
+          type: 'user',
+          timestamp: '2026-04-29T05:45:14.092Z',
+          message: { role: 'user', content: 'hello' },
+        }) + '\n',
+        'utf8',
+      );
+    }
+    const got = findJsonlsContainingExactContent(dir, 'hello');
+    expect(got.length).toBe(2);
+    expect(got).toEqual(expect.arrayContaining([a, b]));
+  });
+
+  it('respects acceptCandidate to filter the candidate set', () => {
+    const knownSid = '11111111-1111-4111-8111-111111111111';
+    const known = join(dir, `${knownSid}.jsonl`);
+    const unknown = join(dir, 'unknown.jsonl');
+    for (const p of [known, unknown]) {
+      appendFileSync(
+        p,
+        JSON.stringify({
+          type: 'user',
+          timestamp: '2026-04-29T05:45:14.092Z',
+          message: { role: 'user', content: 'who are you' },
+        }) + '\n',
+        'utf8',
+      );
+    }
+    const onlyUnknown = findJsonlsContainingExactContent(dir, 'who are you', {
+      acceptCandidate: (path) => !path.includes(knownSid),
+    });
+    expect(onlyUnknown).toEqual([unknown]);
+  });
+
+  it('respects minEventTimestampMs (rejects events older than the gate)', () => {
+    const a = join(dir, 'a.jsonl');
+    appendFileSync(
+      a,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-04-29T05:00:00.000Z',
+        message: { role: 'user', content: 'who are you' },
+      }) + '\n',
+      'utf8',
+    );
+    const cutoffMs = Date.parse('2026-04-29T06:00:00.000Z');
+    expect(
+      findJsonlsContainingExactContent(dir, 'who are you', {
+        minEventTimestampMs: cutoffMs,
+      }),
+    ).toEqual([]);
+  });
+
+  it('matches a queue-operation/enqueue event when includeQueueOperations is set', () => {
+    const a = join(dir, 'a.jsonl');
+    appendFileSync(
+      a,
+      JSON.stringify({
+        type: 'queue-operation',
+        operation: 'enqueue',
+        timestamp: '2026-04-29T05:45:14.092Z',
+        content: 'queued message',
+      }) + '\n',
+      'utf8',
+    );
+    expect(
+      findJsonlsContainingExactContent(dir, 'queued message', {
+        includeQueueOperations: true,
+      }),
+    ).toEqual([a]);
+    expect(
+      findJsonlsContainingExactContent(dir, 'queued message'),
+    ).toEqual([]); // off by default
+  });
+
+  it('returns empty list on missing dir / empty content', () => {
+    expect(findJsonlsContainingExactContent(join(dir, 'nope'), 'x')).toEqual([]);
+    expect(findJsonlsContainingExactContent(dir, '')).toEqual([]);
+  });
+});
+
+// ─── splitTranscriptEventsByCutoff ─────────────────────────────────────────
+//
+// Lock down the split-live behaviour the bridge fingerprint switch and the
+// pid-fd rotation switch both depend on. Without this, switching to a
+// long-lived /clear-induced jsonl re-emits every prior iTerm-typed turn as
+// a "🖥️ 终端本地对话" card (the user-reported "把之前所有轮的会话给我先发
+// 过来" symptom).
+describe('splitTranscriptEventsByCutoff', () => {
+  const cutoffMs = Date.parse('2026-04-29T13:00:00.000Z');
+  const userEv = (timestamp: string | undefined, uuid: string, content = 'msg'): TranscriptEvent => ({
+    type: 'user',
+    uuid,
+    timestamp,
+    message: { role: 'user', content },
+  } as TranscriptEvent);
+  const assistantEv = (timestamp: string | undefined, uuid: string, text = 'reply'): TranscriptEvent => ({
+    type: 'assistant',
+    uuid,
+    timestamp,
+    message: { role: 'assistant', content: [{ type: 'text', text }] },
+  } as TranscriptEvent);
+  // Backwards-compat alias for the simpler tests below — most cases
+  // don't care about role, only timestamp.
+  const ev = userEv;
+
+  it('partitions events by timestamp <= cutoff', () => {
+    const before = ev('2026-04-29T12:00:00.000Z', 'a');
+    const at = ev('2026-04-29T13:00:00.000Z', 'b');
+    const after = ev('2026-04-29T13:00:01.000Z', 'c');
+    const { history, live } = splitTranscriptEventsByCutoff([before, at, after], cutoffMs);
+    expect(history.map((e) => e.uuid)).toEqual(['a', 'b']);
+    expect(live.map((e) => e.uuid)).toEqual(['c']);
+  });
+
+  it('events with no timestamp fall into live (better forward once than drop)', () => {
+    const noTs = ev(undefined, 'd');
+    const { history, live } = splitTranscriptEventsByCutoff([noTs], cutoffMs);
+    expect(history).toEqual([]);
+    expect(live).toEqual([noTs]);
+  });
+
+  it('events with malformed timestamp fall into live', () => {
+    const bad = ev('not-a-date', 'e');
+    const { history, live } = splitTranscriptEventsByCutoff([bad], cutoffMs);
+    expect(history).toEqual([]);
+    expect(live).toEqual([bad]);
+  });
+
+  it('all-history input: live array empty', () => {
+    const a = ev('2026-04-29T11:00:00.000Z', 'a');
+    const b = ev('2026-04-29T11:30:00.000Z', 'b');
+    const { history, live } = splitTranscriptEventsByCutoff([a, b], cutoffMs);
+    expect(history).toEqual([a, b]);
+    expect(live).toEqual([]);
+  });
+
+  it('all-live input: history array empty', () => {
+    const a = ev('2026-04-29T13:01:00.000Z', 'a');
+    const b = ev('2026-04-29T13:02:00.000Z', 'b');
+    const { history, live } = splitTranscriptEventsByCutoff([a, b], cutoffMs);
+    expect(history).toEqual([]);
+    expect(live).toEqual([a, b]);
+  });
+
+  it('the post-/clear scenario: history of iTerm turns absorbed, fresh Lark user event ingested', () => {
+    // Mirrors the production flow: user has been talking in iTerm in the
+    // post-/clear jsonl for a while; sends a Lark message; the file now
+    // contains all the iTerm history PLUS the freshly-written Lark
+    // user event. Cutoff is markTimeMs - 5s. After the split:
+    //   - all iTerm-typed user/assistant events go to history → absorbed
+    //     (no "🖥️ 终端本地对话" replay)
+    //   - the Lark user event is in live → ingest can match its
+    //     fingerprint and start the pending turn
+    const itermUserPriorA = userEv('2026-04-29T11:00:00.000Z', 'iterm-u-a', 'hi from iterm');
+    const itermAsstPriorA = assistantEv('2026-04-29T11:00:01.000Z', 'iterm-a-a', 'hello');
+    const itermUserPriorB = userEv('2026-04-29T12:00:00.000Z', 'iterm-u-b', 'another iterm prompt');
+    const itermAsstPriorB = assistantEv('2026-04-29T12:00:01.000Z', 'iterm-a-b', 'sure');
+    const larkUser = userEv('2026-04-29T13:00:05.000Z', 'lark-u', 'who are you');
+    const { history, live } = splitTranscriptEventsByCutoff(
+      [itermUserPriorA, itermAsstPriorA, itermUserPriorB, itermAsstPriorB, larkUser],
+      cutoffMs,
+    );
+    expect(history.map((e) => e.uuid)).toEqual([
+      'iterm-u-a', 'iterm-a-a', 'iterm-u-b', 'iterm-a-b',
+    ]);
+    expect(live.map((e) => e.uuid)).toEqual(['lark-u']);
+  });
+
+  it("regression: split history cutoff must be < scanner's inclusive lower bound so a boundary event lands in live", () => {
+    // The fingerprint scanner accepts events with timestamp >=
+    // (markTimeMs - 5_000) — INCLUSIVE. If split's history cutoff used
+    // the same value, an event at exactly that timestamp (e.g. a
+    // freshly-written Lark user event whose `timestamp` happens to
+    // align with our 5s skew) would be eligible for fingerprint match
+    // (driving the switch) AND absorbed as history (preventing the
+    // pending turn from ever starting). The worker must therefore pass
+    // `(markTimeMs - 5_000) - 1` as the split cutoff. This test locks
+    // that contract: with the worker's actual cutoff calculation, a
+    // boundary event lands in live.
+    const markTimeMs = 1_700_000_000_000;
+    const scannerLowerBoundMs = markTimeMs - 5_000;       // scanner accepts >= this
+    const splitHistoryCutoffMs = scannerLowerBoundMs - 1; // worker passes this
+    const boundaryLarkEvent = userEv(
+      new Date(scannerLowerBoundMs).toISOString(),
+      'lark-boundary',
+      'who are you',
+    );
+    const { history, live } = splitTranscriptEventsByCutoff(
+      [boundaryLarkEvent],
+      splitHistoryCutoffMs,
+    );
+    expect(history).toEqual([]);
+    expect(live).toEqual([boundaryLarkEvent]);
+  });
+});
+
+// ─── trailingAssistantText：误兜底回归（PR#174 material-longer 闸 × 整轮拼接） ──
+//
+// 2026-06-11 现场：一个长工作轮（多次 tool_use、13 段过程旁白）结束时模型已
+// 显式 `botmux send`（窗口内最大 contentLength=749），但 joinAssistantText 把
+// 整轮旁白拼成 normalized 1530 当 finalText，material-longer 闸（≥2× 且 +120）
+// 判「未被覆盖」放行兜底，把整轮旁白拼贴发进了群。
+// 修复：非 adopt 的兜底 final 改取「最后一次 tool_use 之后的尾部 assistant
+// 文本」= 真正的收尾回答（该现场 normalized 903 < 749×2 → 正确抑制）。
+describe('trailingAssistantText', () => {
+  const aText = (uuid: string, text: string): TranscriptEvent => ({
+    type: 'assistant', uuid, message: { role: 'assistant', content: [{ type: 'text', text }] },
+  });
+  const aTool = (uuid: string): TranscriptEvent => ({
+    type: 'assistant', uuid, message: { role: 'assistant', content: [{ type: 'tool_use', id: `tu-${uuid}`, name: 'Bash', input: {} } as any] },
+  });
+  const aThinking = (uuid: string): TranscriptEvent => ({
+    type: 'assistant', uuid, message: { role: 'assistant', content: [{ type: 'thinking', thinking: 'hmm' } as any] },
+  });
+  const toolResult = (uuid: string): TranscriptEvent => ({
+    type: 'user', uuid, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'x' } as any] },
+  });
+  const metaLine = (type: string): TranscriptEvent => ({ type } as TranscriptEvent);
+
+  it('pure-text turn (no tool_use): identical to joinAssistantText', () => {
+    const events = [aText('a1', 'first'), aText('a2', 'second')];
+    expect(trailingAssistantText(events, ['a1', 'a2'])).toBe('first\n\nsecond');
+    expect(trailingAssistantText(events, ['a1', 'a2'])).toBe(joinAssistantText(events));
+  });
+
+  it('narration + tool_use + final: returns ONLY the text after the last tool_use', () => {
+    const events = [
+      aText('a1', '旁白：我先看看代码。'),
+      aTool('t1'), toolResult('r1'),
+      aText('a2', '旁白：红了，10 个失败。'),
+      aTool('t2'), toolResult('r2'),
+      aText('a3', '修复完成，PR 已开。'),
+    ];
+    expect(trailingAssistantText(events, ['a1', 'a2', 'a3'])).toBe('修复完成，PR 已开。');
+  });
+
+  it('multi-segment final after the last tool_use is fully collected', () => {
+    const events = [
+      aTool('t1'), toolResult('r1'),
+      aText('a1', '结论第一段。'),
+      aText('a2', '结论第二段。'),
+    ];
+    expect(trailingAssistantText(events, ['a1', 'a2'])).toBe('结论第一段。\n\n结论第二段。');
+  });
+
+  it('thinking lines and non-message meta lines inside the tail are crossed, not boundaries', () => {
+    const events = [
+      aText('a1', '旁白'),
+      aTool('t1'), toolResult('r1'),
+      aText('a2', '收尾上半'),
+      aThinking('th1'),
+      metaLine('last-prompt'), metaLine('ai-title'),
+      aText('a3', '收尾下半'),
+    ];
+    expect(trailingAssistantText(events, ['a1', 'a2', 'a3'])).toBe('收尾上半\n\n收尾下半');
+  });
+
+  it('turn ending in a tool_use (no final text): returns empty — nothing to fall back with', () => {
+    const events = [aText('a1', '旁白'), aTool('t1'), toolResult('r1')];
+    expect(trailingAssistantText(events, ['a1'])).toBe('');
+  });
+
+  it('only collects uuids belonging to THIS turn (a previous turn final right before is not swept in)', () => {
+    const events = [
+      aText('prev', '上一轮的收尾。'),
+      aText('a1', '本轮收尾。'),
+    ];
+    expect(trailingAssistantText(events, ['a1'])).toBe('本轮收尾。');
+  });
+
+  it('field replay of the 2026-06-11 leak: gate passes the joined narration (bug) but suppresses the trailing final (fix)', () => {
+    // 形状还原：旁白若干段 + 多次工具调用 + 精炼收尾；窗口内已有
+    // contentLength=749 的显式 send marker。
+    const narration = Array.from({ length: 12 }, (_, i) => `过程旁白第 ${i} 段：`.padEnd(60, '细'));
+    const finalText = '最终收尾回答：'.padEnd(900, '答');
+    const events: TranscriptEvent[] = [];
+    const uuids: string[] = [];
+    narration.forEach((t, i) => {
+      events.push(aText(`n${i}`, t), aTool(`t${i}`), toolResult(`r${i}`));
+      uuids.push(`n${i}`);
+    });
+    events.push(aText('final', finalText));
+    uuids.push('final');
+
+    const markers = [{ sentAtMs: 5_000, contentLength: 749 }];
+    const turnBase = { markTimeMs: 1_000, isLocal: false };
+
+    const joined = joinAssistantText(events);
+    const trailing = trailingAssistantText(events, uuids);
+    expect(trailing).toBe(finalText);
+
+    // 旧行为：整轮拼接远超 749×2 → 闸放行 → 误兜底（这就是回归本体）
+    expect(shouldSuppressBridgeEmit({ ...turnBase, finalText: joined }, undefined, markers, false)).toBe(false);
+    // 新行为：尾段 900 < 749×2 → 抑制 ✓
+    expect(shouldSuppressBridgeEmit({ ...turnBase, finalText: trailing }, undefined, markers, false)).toBe(true);
+  });
+});

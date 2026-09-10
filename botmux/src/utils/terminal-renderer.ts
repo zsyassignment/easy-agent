@@ -1,0 +1,136 @@
+/**
+ * Headless terminal renderer: feeds PTY data into an xterm-headless instance
+ * and exposes viewport snapshots for the Feishu streaming card (PNG render,
+ * export-text action, usage-limit detection).
+ *
+ * Snapshot semantics match PNG: both read the current viewport
+ * [baseY, baseY + rows). This keeps text export and screenshot consistent
+ * even for alt-screen CLIs (Claude Code) where scrollback isn't meaningful.
+ */
+import xtermHeadless from '@xterm/headless';
+const { Terminal } = xtermHeadless;
+import { createHash } from 'node:crypto';
+
+/** Strip box-drawing characters and collapse runs of spaces. */
+function cleanBoxDrawing(line: string): string {
+  return line
+    .replace(/[─━│┌┐└┘├┤┬┴┼╭╮╯╰]/g, ' ')
+    .replace(/  +/g, ' ')
+    .trimEnd();
+}
+
+/** Bare prompt line: ❯ (Claude) or > (Aiden) with optional trailing whitespace */
+const BARE_PROMPT_RE = /^[❯>]\s*$/;
+/** Input echo: ❯ or > followed by user text */
+const INPUT_ECHO_RE = /^[❯>]\s+\S/;
+/** Empty or whitespace-only */
+const BLANK_RE = /^\s*$/;
+
+/** Hard upper bound — protects snapshot/PNG memory if a pane is reported as
+ *  unreasonably wide. Below this, the actual read width is the xterm's real
+ *  cols (PTY_COLS=160 for spawned sessions, source pane width for adopt
+ *  mode 200-270). Bumping past 320 risks a >5MB canvas per screenshot. */
+const SNAPSHOT_COLS = 320;
+
+/**
+ * Read the current viewport of an xterm-headless Terminal as plain text.
+ *
+ * Extracted as a free function so transient renderers (capture-pane seeded)
+ * can reuse the same line-filtering + trimming logic without instantiating
+ * a full TerminalRenderer (which is built for long-lived buffer accumulation).
+ *
+ * `filter=true` drops the bare-prompt line and the input-echo line — the
+ * card text should show CLI output, not the live cursor reflection.
+ */
+export function readViewportText(
+  terminal: InstanceType<typeof Terminal>,
+  opts: { filter: boolean; readCols?: number; startY?: number; rows?: number },
+): string {
+  const buffer = terminal.buffer.active;
+  const readCols = Math.min(opts.readCols ?? SNAPSHOT_COLS, terminal.cols);
+  const baseY = opts.startY ?? buffer.baseY;
+  const rows = opts.rows ?? terminal.rows;
+  const endY = baseY + rows;
+
+  const lines: string[] = [];
+  for (let y = baseY; y < endY; y++) {
+    const line = buffer.getLine(y);
+    if (!line) continue;
+    const s = cleanBoxDrawing(line.translateToString(true, 0, readCols));
+    if (opts.filter && (BARE_PROMPT_RE.test(s) || INPUT_ECHO_RE.test(s))) continue;
+    lines.push(s);
+  }
+
+  if (opts.filter) {
+    while (lines.length > 0 && BLANK_RE.test(lines[0])) lines.shift();
+  }
+  while (lines.length > 0 && BLANK_RE.test(lines[lines.length - 1])) lines.pop();
+
+  return lines.join('\n');
+}
+
+export class TerminalRenderer {
+  private terminal: InstanceType<typeof Terminal>;
+  private lastHash = '';
+
+  constructor(cols: number, rows: number) {
+    this.terminal = new Terminal({ cols, rows, allowProposedApi: true });
+  }
+
+  /** Feed raw PTY data into the virtual terminal. */
+  write(data: string): void {
+    this.terminal.write(data);
+  }
+
+  /**
+   * Feed raw PTY data and wait until xterm has parsed every queued byte through
+   * this write. Callers that inspect the buffer immediately afterwards must use
+   * this barrier: xterm's ordinary write() API is intentionally asynchronous.
+   */
+  writeAndFlush(data: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      try {
+        this.terminal.write(data, resolve);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  /** Reset the change-detection hash so the next snapshot registers as changed. */
+  markNewTurn(): void {
+    this.lastHash = '';
+  }
+
+  /** Filtered viewport snapshot — drops the bare prompt + input echo lines. */
+  snapshot(): { content: string; changed: boolean } {
+    const content = this.readViewport(true);
+    const hash = createHash('md5').update(content).digest('hex');
+    const changed = hash !== this.lastHash;
+    this.lastHash = hash;
+    return { content, changed };
+  }
+
+  /**
+   * Raw viewport snapshot — no line filtering. Used by usage-limit detection
+   * and the CoCo picker, which need the full screen including ❯ cursor lines.
+   */
+  rawSnapshot(): string {
+    return this.readViewport(false);
+  }
+
+  private readViewport(filter: boolean): string {
+    return readViewportText(this.terminal, { filter });
+  }
+
+  resize(cols: number, rows: number): void {
+    this.terminal.resize(cols, rows);
+  }
+
+  /** Expose the underlying xterm-headless instance for screenshot rendering. */
+  get xterm(): InstanceType<typeof Terminal> { return this.terminal; }
+
+  dispose(): void {
+    this.terminal.dispose();
+  }
+}

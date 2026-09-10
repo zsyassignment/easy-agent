@@ -315,20 +315,18 @@ Bridge 支持稳定用户/会话映射、SSE 进度转发、LangGraph Interrupt 
 以及 BotMux PDF/Markdown/TXT 附件自动上传并防重复索引。完整说明和 BotMux 侧最小适配补丁见
 [`integrations/botmux/README.md`](integrations/botmux/README.md)。
 
-如果希望在本项目目录下准备一套固定版本、已经应用 LearningFlow 适配的完整
-BotMux，可执行：
+仓库的 [`botmux/`](botmux/) 目录直接包含完整 BotMux 源码和已经注册好的
+`learningflow` Adapter，不需要再运行脚本拉取另一个仓库：
 
 ```bash
-# 拉取固定上游提交并应用适配补丁
-bash vendor/botmux/bootstrap.sh
-
-# 同时安装 Bun 依赖；使用 --build 可继续完成构建
-bash vendor/botmux/bootstrap.sh --install
+cd botmux
+bun install --frozen-lockfile
+bun run build
 ```
 
-BotMux 会生成在被 Git 忽略的 `vendor/botmux/runtime/`，第三方源码不会重复提交到
-本仓库。飞书配置模板见 [`vendor/botmux/bots.json.example`](vendor/botmux/bots.json.example)，
-其中仅包含占位符。详细说明见 [`vendor/botmux/README.md`](vendor/botmux/README.md)。
+飞书配置模板见 [`botmux/bots.learningflow.example.json`](botmux/bots.learningflow.example.json)，
+完整启动说明见 [`botmux/LEARNINGFLOW.md`](botmux/LEARNINGFLOW.md)。示例中的 App ID、Secret
+和路径均为占位符，真实凭据只应保存在本机的 `~/.botmux/bots.json`。
 
 ## API
 

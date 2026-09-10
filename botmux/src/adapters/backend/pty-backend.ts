@@ -1,0 +1,80 @@
+import * as pty from 'node-pty';
+import { chmodSync, statSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { createRequire } from 'node:module';
+import type { SessionBackend, SpawnOpts } from './types.js';
+import { logger } from '../../utils/logger.js';
+
+// npx may strip execute bits from prebuilt binaries — fix before first spawn.
+try {
+  const req = createRequire(import.meta.url);
+  const helper = join(dirname(req.resolve('node-pty/package.json')),
+    'prebuilds', `${process.platform}-${process.arch}`, 'spawn-helper');
+  const mode = statSync(helper).mode;
+  if (!(mode & 0o111)) chmodSync(helper, mode | 0o755);
+} catch { /* best effort */ }
+
+export class PtyBackend implements SessionBackend {
+  private process: pty.IPty | null = null;
+
+  /** Claude Code session JSONL path — set by worker for claude-code sessions so
+   *  the claude-code adapter can verify paste+Enter submissions via file growth. */
+  claudeJsonlPath?: string;
+  /** PID of the spawned Claude Code child — used by the claude-code adapter to
+   *  follow Claude's authoritative session id via ~/.claude/sessions/<pid>.json. */
+  cliPid?: number;
+  /** Working directory the CLI was spawned in — cross-checked against the pid
+   *  file's cwd field so a recycled PID can't mislead the resolver. */
+  cliCwd?: string;
+
+  spawn(bin: string, args: string[], opts: SpawnOpts): void {
+    logger.debug(
+      `[pty] spawn bin=${bin} args=${JSON.stringify(args)} ` +
+      `cwd=${opts.cwd} ${opts.cols}x${opts.rows}`,
+    );
+    this.process = pty.spawn(bin, args, {
+      name: 'xterm-256color',
+      cols: opts.cols,
+      rows: opts.rows,
+      cwd: opts.cwd,
+      // No shared backing server here, so per-bot env (opts.injectEnv) is safe
+      // to merge straight into the child env — appended last so it wins over a
+      // same-named key already in opts.env.
+      env: opts.injectEnv ? { ...opts.env, ...opts.injectEnv } : opts.env,
+    });
+    logger.debug(`[pty] spawned pid=${this.process.pid}`);
+  }
+
+  write(data: string): boolean {
+    if (!this.process) return false;
+    this.process.write(data);
+    return true;
+  }
+
+  resize(cols: number, rows: number): void {
+    this.process?.resize(cols, rows);
+  }
+
+  /** Must be called AFTER spawn(). Callbacks registered before spawn are silently lost. */
+  onData(cb: (data: string) => void): void {
+    this.process?.onData(cb);
+  }
+
+  /** Must be called AFTER spawn(). Callbacks registered before spawn are silently lost. */
+  onExit(cb: (code: number | null, signal: string | null) => void): void {
+    this.process?.onExit(({ exitCode, signal }) => {
+      cb(exitCode, signal !== undefined ? String(signal) : null);
+    });
+  }
+
+  getChildPid(): number | null {
+    return this.process?.pid ?? null;
+  }
+
+  kill(): void {
+    if (this.process) {
+      try { this.process.kill(); } catch { /* already dead */ }
+      this.process = null;
+    }
+  }
+}
