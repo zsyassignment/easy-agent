@@ -425,7 +425,7 @@ PYTHONPATH=backend .venv/bin/pytest
 ## 检索评测
 
 独立评测位于 `evals/rag/`，包含 100 道五分桶题目。扩展模式使用 29 篇跨领域混合文档、
-约 39.4 万字符和 1188 个 Chunk，并支持 Dense、BM25、Hybrid RRF 对照：
+约 39.4 万字符和 1186 个 Chunk，并支持 Dense、BM25、Hybrid RRF 对照：
 
 ```bash
 PYTHONPATH=backend .venv/bin/python -m evals.rag.runner \

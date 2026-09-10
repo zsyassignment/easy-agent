@@ -14,7 +14,7 @@
     "documents": 29,
     "chunks": 1186,
     "characters": 393797,
-    "indexing_ms": 36932.71956220269
+    "indexing_ms": 35848.152165766805
   },
   "dataset": {
     "split": "test",
@@ -38,7 +38,7 @@
       "ndcg_at_5": 0.6514937854696929,
       "term_coverage": 0.7552083333333335,
       "negative_empty": 0.0,
-      "latency_ms": 305.2816069626715,
+      "latency_ms": 303.4216192027088,
       "total": 80,
       "split": "test",
       "bucket_counts": {
@@ -59,7 +59,7 @@
       "ndcg_at_5": 0.7978286097920676,
       "term_coverage": 0.8541666666666666,
       "negative_empty": 0.0625,
-      "latency_ms": 6.86103620682843,
+      "latency_ms": 5.906746967229992,
       "total": 80,
       "split": "test",
       "bucket_counts": {
@@ -80,7 +80,7 @@
       "ndcg_at_5": 0.8136041956029503,
       "term_coverage": 0.8697916666666666,
       "negative_empty": 0.0,
-      "latency_ms": 312.2244865342509,
+      "latency_ms": 309.4076915818732,
       "total": 80,
       "split": "test",
       "bucket_counts": {
@@ -104,7 +104,7 @@
         "ndcg_at_5": 0.5580221488953983,
         "term_coverage": 0.78125,
         "negative_empty": 0.0,
-        "latency_ms": 307.5449177995324
+        "latency_ms": 301.6778928868007
       },
       "factual": {
         "hit_at_5": 0.875,
@@ -114,7 +114,7 @@
         "ndcg_at_5": 0.8057993287946483,
         "term_coverage": 0.84375,
         "negative_empty": 0.0,
-        "latency_ms": 308.2062258035876
+        "latency_ms": 306.33926624432206
       },
       "multi_hop": {
         "hit_at_5": 1.0,
@@ -124,7 +124,7 @@
         "ndcg_at_5": 0.6825039409162723,
         "term_coverage": 0.6458333333333331,
         "negative_empty": 0.0,
-        "latency_ms": 306.96015362627804
+        "latency_ms": 303.96299294079654
       },
       "negative": {
         "hit_at_5": 0.0,
@@ -134,7 +134,7 @@
         "ndcg_at_5": 0.0,
         "term_coverage": 0.0,
         "negative_empty": 0.0,
-        "latency_ms": 296.16822573007084
+        "latency_ms": 302.75249865371734
       },
       "paraphrase": {
         "hit_at_5": 0.75,
@@ -144,7 +144,7 @@
         "ndcg_at_5": 0.5596497232724515,
         "term_coverage": 0.75,
         "negative_empty": 0.0,
-        "latency_ms": 307.52851185388863
+        "latency_ms": 302.3754452879075
       }
     },
     "bm25": {
@@ -156,7 +156,7 @@
         "ndcg_at_5": 0.6264824383928644,
         "term_coverage": 0.78125,
         "negative_empty": 0.0,
-        "latency_ms": 4.2020703258458525
+        "latency_ms": 4.280091903638095
       },
       "factual": {
         "hit_at_5": 1.0,
@@ -166,7 +166,7 @@
         "ndcg_at_5": 0.9538662191964322,
         "term_coverage": 0.96875,
         "negative_empty": 0.0,
-        "latency_ms": 3.445900685619563
+        "latency_ms": 3.703948576003313
       },
       "multi_hop": {
         "hit_at_5": 1.0,
@@ -176,7 +176,7 @@
         "ndcg_at_5": 0.9070995623825413,
         "term_coverage": 0.9166666666666666,
         "negative_empty": 0.0,
-        "latency_ms": 4.394712537759915
+        "latency_ms": 14.25391889642924
       },
       "negative": {
         "hit_at_5": 0.0,
@@ -186,7 +186,7 @@
         "ndcg_at_5": 0.0,
         "term_coverage": 0.0,
         "negative_empty": 0.0625,
-        "latency_ms": 10.48518079915084
+        "latency_ms": 3.37667774874717
       },
       "paraphrase": {
         "hit_at_5": 0.75,
@@ -196,7 +196,7 @@
         "ndcg_at_5": 0.7038662191964322,
         "term_coverage": 0.75,
         "negative_empty": 0.0,
-        "latency_ms": 11.777316685765982
+        "latency_ms": 3.9190977113321424
       }
     },
     "hybrid": {
@@ -208,7 +208,7 @@
         "ndcg_at_5": 0.6346655479910805,
         "term_coverage": 0.78125,
         "negative_empty": 0.0,
-        "latency_ms": 311.83640504605137
+        "latency_ms": 306.0357531066984
       },
       "factual": {
         "hit_at_5": 1.0,
@@ -218,7 +218,7 @@
         "ndcg_at_5": 0.9538662191964322,
         "term_coverage": 0.96875,
         "negative_empty": 0.0,
-        "latency_ms": 311.7239037528634
+        "latency_ms": 310.1244352583308
       },
       "multi_hop": {
         "hit_at_5": 1.0,
@@ -228,7 +228,7 @@
         "ndcg_at_5": 0.9147736051739132,
         "term_coverage": 0.9166666666666666,
         "negative_empty": 0.0,
-        "latency_ms": 311.44494834006764
+        "latency_ms": 318.2905051216949
       },
       "negative": {
         "hit_at_5": 0.0,
@@ -238,7 +238,7 @@
         "ndcg_at_5": 0.0,
         "term_coverage": 0.0,
         "negative_empty": 0.0,
-        "latency_ms": 306.72591348411515
+        "latency_ms": 306.21238218736835
       },
       "paraphrase": {
         "hit_at_5": 0.8125,
@@ -248,9 +248,9 @@
         "ndcg_at_5": 0.751111410050375,
         "term_coverage": 0.8125,
         "negative_empty": 0.0,
-        "latency_ms": 319.39126204815693
+        "latency_ms": 306.3753822352737
       }
     }
   },
-  "generated_at": "2026-09-10T17:54:47.940119+00:00"
+  "generated_at": "2026-09-10T17:59:59.546168+00:00"
 }
