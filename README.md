@@ -424,8 +424,8 @@ PYTHONPATH=backend .venv/bin/pytest
 
 ## 检索评测
 
-独立评测位于 `evals/rag/`，包含 100 道五分桶题目。扩展模式使用 51 篇混合文档、
-约 34.6 万字符和 1151 个 Chunk，并支持 Dense、BM25、Hybrid RRF 对照：
+独立评测位于 `evals/rag/`，包含 100 道五分桶题目。扩展模式使用 29 篇跨领域混合文档、
+约 39.4 万字符和 1188 个 Chunk，并支持 Dense、BM25、Hybrid RRF 对照：
 
 ```bash
 PYTHONPATH=backend .venv/bin/python -m evals.rag.runner \
@@ -499,5 +499,5 @@ conversation_messages 原始消息永久保存
 PYTHONPATH=backend .venv/bin/python -m evals.rag.runner --split test --k 5
 ```
 
-扩展测试集基线（64 道可回答题）为 Hybrid Recall@5 80.47%、MRR 76.82%、NDCG@5 75.13%；
+扩展测试集基线（64 道可回答题）为 Hybrid Recall@5 86.72%、MRR 81.56%、NDCG@5 81.36%；
 详细口径、Dense/BM25 对照和负样本边界见 `evals/rag/README.md`。加 `--end-to-end` 可另行评估回答、引用和最终拒答。
