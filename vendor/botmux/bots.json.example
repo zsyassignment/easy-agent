@@ -1,0 +1,14 @@
+[
+  {
+    "name": "learningflow",
+    "larkAppId": "cli_your_feishu_app_id",
+    "larkAppSecret": "your_feishu_app_secret",
+    "cliId": "learningflow",
+    "cliPath": "/absolute/path/to/easy-agent/scripts/start-botmux-bridge.sh",
+    "workingDir": "/absolute/path/to/easy-agent",
+    "env": {
+      "LEARNINGFLOW_BASE_URL": "http://127.0.0.1:8010",
+      "BOTMUX_SCHEDULE_TIMEZONE": "Asia/Shanghai"
+    }
+  }
+]

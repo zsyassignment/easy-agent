@@ -1,0 +1,284 @@
+diff --git a/README.en.md b/README.en.md
+index 944012a..ec1ec5c 100644
+--- a/README.en.md
++++ b/README.en.md
+@@ -81,7 +81,7 @@ More: [Roles & teams](https://deepcoldy.github.io/botmux/en/roles) · [File sand
+
+ Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (process-isolated, reachable via `tmux attach`) and API / cloud agents (e.g. Mira, riff — reached over API / remote, not a local process; mojo is API-driven but executes tools on the bot host by default, set cloud: true for the remote sandbox). Representative ones:
+
+-`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `hermes` · `ebsd` · `mira` · `riff` (cloud agent) … · `mojo` (API-driven, host execution by default) …
++`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `hermes` · `ebsd` · `mira` · `learningflow` (LearningFlow Agent) · `riff` (cloud agent) … · `mojo` (API-driven, host execution by default) …
+
+ The `ebsd` adapter uses a dedicated external service identity and native OMP session storage. Operators must provide the Diag Gateway token and ByteCloud service account through permission-restricted files, never through `bots.json`.
+
+diff --git a/README.md b/README.md
+index e003fd2..1f3c636 100644
+--- a/README.md
++++ b/README.md
+@@ -81,7 +81,7 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
+
+ `bots.json` 里用 `cliId` 一键切换。**20+ 适配器**，覆盖本地 CLI（进程隔离，`tmux attach` 可直连）和 API / 云 Agent（如 Mira、riff——通过 API / 远端接入，非本地进程；mojo 为 API 驱动、默认在宿主机执行工具，可配 cloud: true 走云沙箱）。代表项：
+
+-`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `ebsd` · `mira` · `riff`(云 Agent) … · `mojo`(API 驱动,默认宿主机执行) …
++`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `ebsd` · `mira` · `learningflow`(LearningFlow Agent) · `riff`(云 Agent) … · `mojo`(API 驱动,默认宿主机执行) …
+
+ `ebsd` 使用独立的外部服务身份和原生 OMP 会话目录；部署方必须通过受限权限文件配置 Diag Gateway token 与 ByteCloud service account，不能把密钥写入 `bots.json`。
+
+diff --git a/src/adapters/cli/registry.ts b/src/adapters/cli/registry.ts
+index f712332..3aae9e6 100644
+--- a/src/adapters/cli/registry.ts
++++ b/src/adapters/cli/registry.ts
+@@ -20,6 +20,7 @@ import { createAntigravityAdapter } from './antigravity.js';
+ import { createMtrAdapter } from './mtr.js';
+ import { createHermesAdapter } from './hermes.js';
+ import { createMiraAdapter } from './mira.js';
++import { createLearningFlowAdapter } from './learningflow.js';
+ import { createMirAdapter } from './mir.js';
+ import { createTraexAdapter } from './traex.js';
+ import { createPiAdapter } from './pi.js';
+@@ -61,6 +62,7 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
+   hermes: 'hermes',
+   // API-backed; no local executable is required.
+   mira: undefined,
++  learningflow: 'learningflow-botmux-bridge',
+   // The adapter itself launches a bundled Node runner; mircli is its real
+   // second-stage dependency.
+   mir: 'mircli',
+@@ -224,7 +226,7 @@ export async function createCliAdapter(id: CliId, pathOverride?: string): Promis
+   return adapter;
+ }
+
+-export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createEbsdAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter, createDshTuiAdapter, createMojoAdapter };
++export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createLearningFlowAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createEbsdAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter, createDshTuiAdapter, createMojoAdapter };
+
+ /** Synchronous version for use in worker process. */
+ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
+@@ -245,6 +247,7 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
+     case 'mtr': return createMtrAdapter(pathOverride);
+     case 'hermes': return createHermesAdapter(pathOverride);
+     case 'mira': return createMiraAdapter(pathOverride);
++    case 'learningflow': return createLearningFlowAdapter(pathOverride);
+     case 'mir': return createMirAdapter(pathOverride);
+     case 'traex': return createTraexAdapter(pathOverride);
+     case 'pi': return createPiAdapter(pathOverride);
+diff --git a/src/adapters/cli/types.ts b/src/adapters/cli/types.ts
+index 41e26a5..1cc2f8c 100644
+--- a/src/adapters/cli/types.ts
++++ b/src/adapters/cli/types.ts
+@@ -676,4 +676,4 @@ export interface CliAdapter {
+   buildSessionRenameCommand?(title: string): string;
+ }
+
+-export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo';
++export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'learningflow' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo';
+diff --git a/src/core/passthrough-commands.ts b/src/core/passthrough-commands.ts
+index 7058fb0..69b9e0c 100644
+--- a/src/core/passthrough-commands.ts
++++ b/src/core/passthrough-commands.ts
+@@ -80,7 +80,7 @@ export const SLASH_COMMAND_SHAPE = /^\/[a-z0-9][a-z0-9:_-]*$/;
+  * left 11 PTY quick-action buttons that silently did nothing. Any gate deciding
+  * "can this CLI receive typed input" must call the predicate below, never
+  * hand-write a member of this set. */
+-const NO_RAW_PASSTHROUGH_CLI_IDS: ReadonlySet<string> = new Set(['codex-app', 'mira', 'mir', 'dsh', 'ebsd']);
++const NO_RAW_PASSTHROUGH_CLI_IDS: ReadonlySet<string> = new Set(['codex-app', 'mira', 'learningflow', 'mir', 'dsh', 'ebsd']);
+
+ /**
+  * True for a CLI with no raw-passthrough surface (see
+diff --git a/src/im/lark/card-builder.ts b/src/im/lark/card-builder.ts
+index efa71c9..21c49b0 100644
+--- a/src/im/lark/card-builder.ts
++++ b/src/im/lark/card-builder.ts
+@@ -294,6 +294,7 @@ const cliDisplayNames: Record<CliId, string> = {
+   'mtr': 'MTR',
+   'hermes': 'Hermes',
+   'mira': 'Mira',
++  'learningflow': 'LearningFlow Agent',
+   'mir': 'Mir CLI',
+   'traex': 'TRAE',
+   'pi': 'Pi',
+@@ -1047,7 +1048,7 @@ export function buildStreamingCard(
+   //
+   // 判据必须**调谓词**（cliHasNoRawPassthroughSurface），不能手写单个 cliId 字面量：
+   //   ① remote CLI（riff/mojo）无本地终端可驱动；
+-  //   ② 无 raw passthrough 面的 CLI（codex-app/mira/mir/dsh/ebsd）——/compact 走 raw_input
++  //   ② 无 raw passthrough 面的 CLI（codex-app/mira/learningflow/mir/dsh/ebsd）——/compact 走 raw_input
+   //      把字面量写进 PTY，绕过 runner 的 `::botmux-<id>:<base64>` 帧协议：dsh 打
+   //      `ignoring non-frame input` 静默丢弃，mira/mir 把 `/compact` 当**普通用户消息**
+   //      发给模型白烧一个 turn。打字发 /compact 本就被 router 的
+diff --git a/src/setup/bot-config-editor.ts b/src/setup/bot-config-editor.ts
+index fd9016e..06d9cf5 100644
+--- a/src/setup/bot-config-editor.ts
++++ b/src/setup/bot-config-editor.ts
+@@ -42,6 +42,7 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
+   // （25→reasonix、26→opencode2、27→dsh）。
+   '28': 'mojo',
+   '29': 'ebsd',
++  '30': 'learningflow',
+ };
+
+ const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
+@@ -66,6 +67,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
+   'hermes': 'Hermes',
+   'codex-app': 'Codex App',
+   'mira': 'Mira',
++  'learningflow': 'LearningFlow Agent',
+   'seed': 'Seed',
+   'traex': 'TRAE',
+   'pi': 'Pi',
+diff --git a/src/worker.ts b/src/worker.ts
+index 252f673..5c6e4ac 100644
+--- a/src/worker.ts
++++ b/src/worker.ts
+@@ -2175,7 +2175,7 @@ let closeRequested = false;
+ let capturedSpawnCommand: string | null = null;
+ let deferredTopicOutputTail = '';
+ const reportedDeferredTopicRoots = new Set<string>();
+-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', opencode2: 'OpenCode 2', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', ebsd: 'ebsd', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff', reasonix: 'Reasonix', dsh: 'DeepSeek Harness', 'dsh-tui': 'DeepSeek Harness TUI', mojo: 'Mojo' };
++const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', opencode2: 'OpenCode 2', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', learningflow: 'LearningFlow Agent', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', ebsd: 'ebsd', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff', reasonix: 'Reasonix', dsh: 'DeepSeek Harness', 'dsh-tui': 'DeepSeek Harness TUI', mojo: 'Mojo' };
+ function cliName(): string {
+   return (lastInitConfig?.cliRuntime?.source === 'configured'
+     ? (lastInitConfig.cliRuntime.displayName?.trim() || lastInitConfig.cliRuntime.id)
+@@ -9140,7 +9140,7 @@ function handleVisibleStartupInteraction(data: string): boolean {
+ // does not (PR #597): its signed Unix-socket channel is independent of the
+ // terminal/backend rendering (including Herdr and Zellij), so it is no longer
+ // in the terminal-OSC decode set.
+-const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh']);
++const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh', 'learningflow']);
+ const appRunnerControlDecoder = new RunnerControlDecoder();
+ let kiroSessionIdCaptureArmed = false;
+ let kiroSessionIdCaptureBuffer = '';
+diff --git a/test/cli-id-roster-derivation.test.ts b/test/cli-id-roster-derivation.test.ts
+index da38eed..74cb356 100644
+--- a/test/cli-id-roster-derivation.test.ts
++++ b/test/cli-id-roster-derivation.test.ts
+@@ -87,7 +87,7 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
+       dsh: 'none',
+       // PTY-driven TUI variant of dsh; no skills dir of its own.
+       'dsh-tui': 'none',
+-      mira: 'none', mir: 'none', copilot: 'none', kimi: 'none', riff: 'none',
++      mira: 'none', learningflow: 'none', mir: 'none', copilot: 'none', kimi: 'none', riff: 'none',
+     };
+     // Two-way key equality. `Record<CliId, …>` looks like tsc enforces
+     // exhaustiveness, but this file lives in test/ and tsconfig only includes
+diff --git a/src/adapters/cli/learningflow.ts b/src/adapters/cli/learningflow.ts
+new file mode 100644
+index 0000000..8a249cb
+--- /dev/null
++++ b/src/adapters/cli/learningflow.ts
+@@ -0,0 +1,55 @@
++import { resolveCommand } from './registry.js';
++import type { CliAdapter, PtyHandle, WriteInputContext } from './types.js';
++import { writeRunnerInput } from './runner-input.js';
++
++/**
++ * BotMux adapter for the standalone Python runner shipped by LearningFlow.
++ *
++ * Install the `learningflow-botmux-bridge` wrapper on PATH, or set the bot's
++ * cliPath to /absolute/path/to/langgraph-learning-agent/scripts/start-botmux-bridge.sh.
++ */
++export function createLearningFlowAdapter(pathOverride?: string): CliAdapter {
++  const rawBin = pathOverride ?? 'learningflow-botmux-bridge';
++  let cachedBin: string | undefined;
++  return {
++    id: 'learningflow',
++    get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
++    allowExtraArgs: false,
++
++    buildArgs({ sessionId }) {
++      return ['--session-id', sessionId];
++    },
++
++    buildResumeCommand() {
++      // LearningFlow conversation state is server-side and keyed by BotMux's
++      // stable session id, so there is no separate user-facing resume command.
++      return null;
++    },
++
++    versionCommand() {
++      return { bin: 'printf', args: ['LearningFlow Bridge 0.1.0'] };
++    },
++
++    async writeInput(pty: PtyHandle, content: string, context?: WriteInputContext) {
++      return writeRunnerInput(
++        pty,
++        '::botmux-learningflow:',
++        content,
++        undefined,
++        context?.turnId,
++        false,
++        context?.trustedCaller,
++      );
++    },
++
++    completionPattern: undefined,
++    readyPattern: /›/,
++    systemHints: [],
++    injectsSessionContext: false,
++    supportsTypeAhead: false,
++    altScreen: false,
++    readOnlyRemoteScroll: false,
++  };
++}
++
++export const create = createLearningFlowAdapter;
+diff --git a/test/learningflow-adapter.test.ts b/test/learningflow-adapter.test.ts
+new file mode 100644
+index 0000000..cdc3dc5
+--- /dev/null
++++ b/test/learningflow-adapter.test.ts
+@@ -0,0 +1,55 @@
++import { Buffer } from 'node:buffer';
++import { describe, expect, it } from 'vitest';
++import { createLearningFlowAdapter } from '../src/adapters/cli/learningflow.js';
++import type { PtyHandle } from '../src/adapters/cli/types.js';
++
++function decodeWrite(value: string): Record<string, unknown> {
++  const prefix = '::botmux-learningflow:';
++  expect(value.endsWith('\r')).toBe(true);
++  expect(value.startsWith(prefix)).toBe(true);
++  return JSON.parse(Buffer.from(value.slice(prefix.length, -1), 'base64').toString('utf8'));
++}
++
++describe('LearningFlow adapter', () => {
++  it('starts the external bridge with the BotMux session id', () => {
++    const adapter = createLearningFlowAdapter('/opt/learningflow-bridge');
++    expect(adapter.id).toBe('learningflow');
++    expect(adapter.resolvedBin).toBe('/opt/learningflow-bridge');
++    expect(adapter.buildArgs({ sessionId: 'session-1', resume: false })).toEqual([
++      '--session-id', 'session-1',
++    ]);
++    expect(adapter.allowExtraArgs).toBe(false);
++    expect(adapter.versionCommand?.()).toEqual({
++      bin: 'printf',
++      args: ['LearningFlow Bridge 0.1.0'],
++    });
++    expect(adapter.readyPattern?.test('LearningFlow connected.\n› ')).toBe(true);
++  });
++
++  it('keeps turn correlation and trusted caller in the runner envelope', async () => {
++    const writes: string[] = [];
++    const pty: PtyHandle = { write(value) { writes.push(value); } };
++    const adapter = createLearningFlowAdapter('/opt/learningflow-bridge');
++    const result = await adapter.writeInput(pty, '请结合附件回答', {
++      turnId: 'turn-1',
++      trustedCaller: {
++        requestUserOpenId: 'ou_test',
++        requestLarkAppId: 'cli_test',
++        senderType: 'user',
++      },
++    });
++
++    expect(result).toMatchObject({ submitted: true });
++    expect(writes).toHaveLength(1);
++    expect(decodeWrite(writes[0]!)).toEqual({
++      type: 'message',
++      content: '请结合附件回答',
++      replyTurnId: 'turn-1',
++      trustedCaller: {
++        requestUserOpenId: 'ou_test',
++        requestLarkAppId: 'cli_test',
++        senderType: 'user',
++      },
++    });
++  });
++});
